@@ -1,0 +1,335 @@
+name: Build rTorrent
+
+permissions: write-all
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'matrix.py'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'rTorrent version to build'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - 'all'
+          - '0.9.8'
+          - '0.10.0'
+          - '0.15.0'
+          - '0.15.1'
+          - '0.15.2'
+          - '0.15.3'
+
+jobs:
+  setup-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generating matrix
+        id: generate
+        run: |
+          pip3 install --upgrade pyyaml
+          echo "Generating matrix..."
+          MATRIX=$(python3 matrix.py)
+          echo "$MATRIX" > matrix.json
+          echo "matrix<<EOF" >> $GITHUB_ENV
+          cat matrix.json >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Setup matrix
+        id: set
+        uses: druzsan/setup-matrix@v2
+        with:
+          matrix: |
+            ${{ env.matrix }}
+
+  build:
+    name: v${{ matrix.version }} (${{ matrix.os }})
+    needs: setup-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+      max-parallel: 8
+    container:
+      image: ${{ 
+        startsWith(matrix.os, 'debian-') && (matrix.os == 'debian-11' && 'debian:bullseye' || matrix.os == 'debian-12' && 'debian:bookworm' || 'debian:bookworm') ||
+        startsWith(matrix.os, 'ubuntu-') && format('{0}:{1}', 'ubuntu', matrix.os == 'ubuntu-latest' && 'noble' || matrix.os == 'ubuntu-22.04' && '22.04' || matrix.os == 'ubuntu-24.04' && '24.04' || matrix.os) || '' }}
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      COMMITTER_NAME: ${{ secrets.COMMITTER_NAME }}
+      COMMITTER_EMAIL: ${{ secrets.COMMITTER_EMAIL }}
+      STABILITY: ${{ matrix.stability }}
+
+    steps:
+      - name: Setup variables
+        id: vars
+        run: |
+          echo "build_script=tools/packages/rtorrent/build.sh" >> $GITHUB_OUTPUT
+          echo "package_name=rtorrent-${{ matrix.stability }}" >> $GITHUB_OUTPUT
+          echo "metadata_script=tools/generate_metadata.sh" >> $GITHUB_OUTPUT
+          echo "control_file=tools/packages/rtorrent/control" >> $GITHUB_OUTPUT
+          echo "package_script=tools/generate_package.sh" >> $GITHUB_OUTPUT
+          echo "temp_dir=/tmp/rtorrent-build/install" >> $GITHUB_OUTPUT
+          for script in $(find tools/ -name "*.sh"); do
+            chmod +x $script
+          done
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout tools repository
+        uses: actions/checkout@v4
+        with:
+          repository: MediaEase-binaries/tools
+          path: tools
+
+      - name: Update APT
+        run: |
+          upx="upx-ucl"
+          if [ "${{ matrix.os }}" = "debian-12" ]; then
+            echo "deb http://deb.debian.org/debian bookworm-backports main" >> /etc/apt/sources.list
+            upx="upx-ucl/bookworm-backports"
+          fi
+          apt-get update
+          apt-get install -y apt-transport-https rsync lsb-release curl wget git gzip util-linux \
+            dirmngr software-properties-common gnupg2 ca-certificates gpg-agent dos2unix nfs-common \
+            jq sudo debconf-utils build-essential checkinstall libnss3-tools nano zip \
+            unzip ssl-cert openssl libfcgi0ldbl libtool libcppunit-dev libssl-dev cmake \
+            zlib1g-dev libbz2-dev libreadline-dev libcairo2-dev libcurl4-openssl-dev libgirepository1.0-dev \
+            libncurses5-dev libncursesw5-dev xz-utils tk-dev liblzma-dev $upx \
+            autoconf-archive debian-keyring debian-archive-keyring libicu-dev libgeoip-dev \
+            intltool closure-compiler libnotify4 librsvg2-common xdg-utils pkg-config
+        shell: bash
+
+      - name: Clean output and artifacts
+        run: |
+          rm -rf output artifacts
+          mkdir -p output artifacts
+      - name: Download and install dependency packages
+        id: dependencies
+        shell: bash
+        run: |
+          download_asset() {
+            local version="$1"
+            local filename="$2"
+            local repo="$3"
+            local tag="v${version}"
+            local assets_url=$(curl -s "https://api.github.com/repos/${repo}/releases/tags/${tag}" | jq -r '.assets_url')
+            if [ -z "$assets_url" ] || [ "$assets_url" = "null" ]; then
+              echo "Release not found for $repo $tag"
+              return 1
+            fi
+            local download_url=$(curl -s "$assets_url" | jq -r ".[] | select(.name == \"${filename}\") | .browser_download_url")
+            if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
+              echo "Asset not found: $filename in $repo $tag"
+              return 1
+            fi
+            echo "Downloading from: $download_url"
+            if command -v curl >/dev/null 2>&1; then
+              curl -L -o "$filename" "$download_url"
+            else
+              wget -O "$filename" "$download_url"
+            fi
+            return 0
+          }
+          codename=$(lsb_release -cs)
+          distro=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
+          os="$distro-$codename"
+
+          declare -A packages=(
+            ["xmlrpc-c"]="libxmlrpc-c3_${{ matrix.xmlrpc_c_version }}-1build1_${os}_amd64.deb|MediaEase-binaries/xmlrpc-c-builds|${{ matrix.xmlrpc_c_version }}"
+            ["libudns"]="libudns_${{ matrix.libudns_version }}-ipv6-ON-1build1_amd64.deb|MediaEase-binaries/libudns-builds|${{ matrix.libudns_version }}"
+            ["dumptorrent"]="dumptorrent_${{ matrix.dumptorrent_version }}-ubuntu-latest_amd64.deb|tomcdj71/dumptorrent|${{ matrix.dumptorrent_version }}"
+            ["mktorrent"]="mktorrent_${{ matrix.mktorrent_version }}_openssl-ON_pthreads-ON-ubuntu-noble_amd64.deb|tomcdj71/mktorrent|${{ matrix.mktorrent_version }}"
+          )
+          for pkg in "${!packages[@]}"; do
+            IFS='|' read -r filename repo version <<< "${packages[$pkg]}"
+            if [ "$pkg" = "xmlrpc-c" ] && { [ "$version" = "" ] || [ "$version" = "null" ]; }; then
+              sudo apt-get install -yqq tinyxml2-*
+            else
+              if [[ "$filename" == mktorrent* && "$version" != "1.5.0" ]]; then
+                filename="${filename/ubuntu-noble/ubuntu-latest}"
+              fi
+              if download_asset "$version" "$filename" "$repo"; then
+                if [ "$pkg" != "mktorrent" ]; then
+                  sudo dpkg -i "$filename" || true
+                elif [[ "$filename" == mktorrent* && "$version" == "1.5.0" ]]; then
+                  sudo dpkg -i "$filename" || true
+                fi
+              else
+                echo "::error::Failed to download $filename"
+                exit 1
+              fi
+            fi
+          done
+
+          sudo apt-get install -f -y
+          echo "dependencies=done" >> $GITHUB_OUTPUT
+          echo "======> All dependency packages installed successfully"
+
+      - name: Build rTorrent
+        id: build
+        run: |
+          sed -i "s/@PACKAGE_NAME@/${{ steps.vars.outputs.package_name }}/" ${{ steps.vars.outputs.control_file }}
+          sed -i "s/@MAINTAINER@/${{ secrets.COMMITTER_NAME }} <${{ secrets.COMMITTER_EMAIL }}>/" ${{ steps.vars.outputs.control_file }}
+          chmod +x ${{ steps.vars.outputs.build_script }}
+          ./${{ steps.vars.outputs.build_script }} ${{ matrix.version }}
+          echo "compiled=true" >> $GITHUB_OUTPUT
+
+      - name: Generate metadata
+        if: steps.build.outputs.compiled == 'true'
+        run: |
+          deb=$(find / -name "rtorrent-*.deb")
+          mkdir -p artifacts
+          cp "$deb" artifacts/
+          codename=$(lsb_release -cs)
+          distro=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
+          os="$distro-$codename"
+          cd artifacts
+          ../${{ steps.vars.outputs.metadata_script }} \
+            --category "rtorrent" \
+            --tag "${{ matrix.stability }}" \
+            --version "${{ matrix.version }}" \
+            --os "${codename}" \
+            "$(basename "$deb")"
+          ls -l
+
+      - name: Upload as Artifact
+        if: steps.build.outputs.compiled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtorrent-${{ matrix.version }}-${{ matrix.os }}
+          path: artifacts/*
+          retention-days: 1
+
+  release:
+    name: Create Releases
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        version: ['0.9.8', '0.10.0', '0.15.0', '0.15.1', '0.15.2', '0.15.3']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Download artifacts for this version
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded_artifacts
+          pattern: rtorrent-*${{ matrix.version }}*
+      - name: Prepare release assets
+        id: prepare
+        run: |
+          mkdir -p release_assets
+          find downloaded_artifacts -type f \
+            \( -name "rtorrent-*${{ matrix.version }}*.deb" -o \
+              -name "rtorrent-*${{ matrix.version }}*.json" \) \
+            -exec cp {} release_assets/ \;
+          TEMP_DIR=$(mktemp -d)
+          PACKAGES_TABLE="$TEMP_DIR/packages.md"
+          CONFIG_TABLE="$TEMP_DIR/config.md"
+          {
+            echo "| Package | OS | Stability |"
+            echo "| ------- | -- | --------- |"
+            for f in release_assets/*.deb; do
+              if [ -f "$f" ]; then
+                pkg=$(basename "$f")
+                os=$(echo "$pkg" | grep -o "debian-[^ _]*\|ubuntu-[^ _]*" || echo "unknown")
+                stability=$(echo "$pkg" | grep -o "\-stable_\|\-oldstable_\|\-next_" | sed 's/^-//;s/_$//')                
+                echo "| $pkg | $os | $stability |"
+              fi
+            done
+          } > "$PACKAGES_TABLE"
+
+          {
+            cmake_cmd='-DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF -DENABLE_XMLRPC=ON -DENABLE_SCgi=ON -DENABLE_TESTS=OFF'
+            echo "| Build Configuration |"
+            echo "| ------------------ |"
+            echo "| \`${cmake_cmd}\` |"
+          } > "$CONFIG_TABLE"
+          echo "packages_table<<EOF" >> $GITHUB_OUTPUT
+          cat "$PACKAGES_TABLE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "config_table<<EOF" >> $GITHUB_OUTPUT
+          cat "$CONFIG_TABLE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          ls -la release_assets/
+          rm -rf "$TEMP_DIR"
+          if [[ ${{ matrix.version }} == *"rc"* ]]; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
+          if [[ -z "$(ls release_assets/*.deb 2>/dev/null)" ]]; then
+            echo "skip_release=true" >> $GITHUB_OUTPUT
+            echo "No packages to release"
+            ls -lah release_assets/
+          else
+            echo "skip_release=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Create Release
+        if: steps.prepare.outputs.skip_release == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ matrix.version }}
+          name: rTorrent ${{ matrix.version }}
+          files: |
+            release_assets/*
+          draft: false
+          prerelease: ${{ steps.prepare.outputs.prerelease }}
+          generate_release_notes: true
+          body: |
+            # rTorrent v${{ matrix.version }}
+
+            Pre-built rTorrent BitTorrent client packages for various Linux distributions.
+
+            ## 🎯 Features
+
+            - Pre-compiled binaries ready to use
+            - Multiple distribution support
+            - Automated builds via GitHub Actions
+            - JSON metadata for automated installations
+
+            ## 📦 Available Packages
+
+            ${{ steps.prepare.outputs.packages_table }}
+
+            ## 🔧 Build Configuration
+
+            ${{ steps.prepare.outputs.config_table }}
+
+            ## 📋 Installation
+
+            ### Manual Installation
+            1. Download the appropriate .deb package for your distribution
+            2. Install using: `sudo dpkg -i package_name.deb`
+            3. Fix any dependencies if needed: `sudo apt-get install -f`
+
+            ## 🔍 Package Details
+
+            The packages are built with:
+            - System-wide installation in `/opt/MediaEase/.binaries/installed/rtorrent-${STABILITY}_${VERSION}`
+            - XMLRPC and SCGI support
+
+            ## 📄 Metadata
+
+            Each package is accompanied by its JSON metadata file containing:
+            - Package information
+            - Checksums
+            - Dependencies
+            - Build configuration
+            - Distribution details
+
+            ## 📝 License
+
+            rTorrent is distributed under the [GNU General Public License v2](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html).
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
