@@ -1,45 +1,42 @@
 # rTorrent Builds
 
-This repository provides automated build scripts for compiling the rTorrent BitTorrent client and creating Debian packages (.deb) for multiple Linux distributions. All builds are automated via GitHub Actions and are available in the GitHub Releases section.
+This repository provides build scripts for compiling the rTorrent BitTorrent client and creating Debian packages (.deb). Packages are produced when the GitHub Actions workflow is run manually; published artifacts appear under **Releases**.
+
+## GitHub Actions
+
+Workflow `.github/workflows/build.yaml` runs **only** on **`workflow_dispatch`**. Pushes to `main` do **not** trigger builds (including changes to `matrix.py`) — use **Actions** → run workflow → choose **`all`** or a specific version.
 
 ## Features
 
-- Automated builds via GitHub Actions
-- Debian packages that install rTorrent in `/opt/MediaEase/.binaries/installed/rtorrent-${STABILITY}_${VERSION}`
-- Support for multiple Linux distributions:
-  - Debian 11 (Bullseye)
-  - Debian 12 (Bookworm)
-  - Ubuntu 22.04 LTS
-  - Ubuntu 24.04 LTS
-- Multiple version support with different stability levels:
-  - Oldstable (0.9.8)
-  - Stable (0.10.0, 0.15.0, 0.15.1, 0.15.2)
-  - Next (0.15.3)
+- Builds via GitHub Actions (manual trigger)
+- Debian packages that install rTorrent in `/opt/Krate/vendor/rtorrent_${VERSION}`
+- CI uses a **single reference image** (see `matrix.py`); **one published package per** rTorrent **version**, intended for recent **Debian and Ubuntu** on **amd64**
+- Version matrix: pinned upstream **tags only** — **`0.15.7`** and **`0.16.11`** (see `matrix.py`)
 - XMLRPC and TinyXML2 support
 - Automated metadata generation
 - Package signing and verification
 
-## Supported Versions & Distributions
+## Supported Versions
 
-| Version    | Stability  | Debian 11 | Debian 12 | Ubuntu 22.04 | Ubuntu 24.04 |
-|------------|------------|-----------|-----------|--------------|--------------|
-| 0.15.3     | next       |     ✘     |     ✔     |      ✘       |      ✔       |
-| 0.15.2     | stable     |     ✘     |     ✔     |      ✘       |      ✔       |
-| 0.15.1     | stable     |     ✘     |     ✔     |      ✘       |      ✔       |
-| 0.15.0     | stable     |     ✘     |     ✔     |      ✘       |      ✔       |
-| 0.10.0     | stable     |     ✔     |     ✔     |      ✔       |      ✔       |
-| 0.9.8      | oldstable  |     ✔     |     ✘     |      ✔       |      ✘       |
+The CI matrix builds **tagged releases only**; it does not multiply distributions—the same `.deb` is provided for Debian/Ubuntu use.
+
+| Version (upstream tag) | Notes    |
+| ---------------------- | -------- |
+| 0.15.7                 | TinyXML2 |
+| 0.16.11                | TinyXML2 |
+
+For local experiments against moving upstream branches, you can still set **`LT_GIT_REF`** and **`RT_GIT_REF`** before `build.sh` (defaults follow the tagged checkout used in CI).
 
 ## Build Process
 
-The build process is fully automated and includes:
+When you start the workflow, the job sequence includes:
 1. Environment setup with all required dependencies
 2. Download and compilation of rTorrent
 3. Static linking of all components
 4. Creation of Debian packages
 5. Generation of JSON metadata
 6. Package signing and verification
-7. Automated release creation
+7. Create or update the GitHub Release (when the workflow completes successfully)
 
 ## Available Packages
 
@@ -52,17 +49,17 @@ Packages are available in the GitHub Releases of this repository. Each release i
 ### Package Structure
 
 The Debian package installs rTorrent in a dedicated directory structure:
-- Base installation path: `/opt/MediaEase/.binaries/installed/rtorrent-${STABILITY}_${VERSION}`
-- Binaries in `/opt/MediaEase/.binaries/installed/rtorrent-${STABILITY}_${VERSION}/usr/bin`
-- Libraries in `/opt/MediaEase/.binaries/installed/rtorrent-${STABILITY}_${VERSION}/usr/lib`
-- Documentation in `/opt/MediaEase/.binaries/installed/rtorrent-${STABILITY}_${VERSION}/usr/share/doc/rtorrent`
+- Base installation path: `/opt/Krate/vendor/rtorrent_${VERSION}`
+- Binaries in `/opt/Krate/vendor/rtorrent_${VERSION}/usr/bin`
+- Libraries in `/opt/Krate/vendor/rtorrent_${VERSION}/usr/lib`
+- Documentation in `/opt/Krate/vendor/rtorrent_${VERSION}/usr/share/doc/rtorrent`
 
 The package uses Debian alternatives to manage the binaries, making them available in the system PATH.
 
 ## Installation
 
 ### Manual Installation
-1. Download the appropriate .deb package for your distribution from the [GitHub Releases](../../releases)
+1. Download the `.deb` for your target rTorrent version from the [GitHub Releases](../../releases)
 2. Install using: `sudo dpkg -i package_name.deb`
 3. Fix any dependencies if needed: `sudo apt-get install -f`
 
@@ -73,7 +70,7 @@ The packages can be installed automatically using the JSON metadata and package 
 
 The build process is configured through:
 - `build.yaml`: GitHub Actions workflow configuration
-- `matrix.py`: Build matrix configuration for different versions and distributions
+- `matrix.py`: Build matrix configuration for upstream versions (single reference OS in CI)
 
 ## Contributing
 
